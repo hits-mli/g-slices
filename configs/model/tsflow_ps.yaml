@@ -1,0 +1,43 @@
+# @package _global_
+model: unconditional
+setting: univariate
+
+runtime:
+  train_module: bin.train_model_ps
+
+model_params:
+  backbone_params:
+    input_dim: 1
+    output_dim: 1
+    step_emb: 64
+    bidirectional: true
+    num_residual_blocks: 3
+    residual_block: s4
+    slice_block_params:
+      block_size: 16
+      diagonal_dense: false
+      bound_norm: false
+    hidden_dim: 64
+    dropout: 0.0
+    init_skip: false
+    feature_skip: true
+  normalization: longmean
+  use_ema: true
+  use_lags: false
+  num_steps: 0
+  solver: euler
+  matching: ot
+  device: cuda:0
+  optimizer_params:
+    lr: 1.0e-3
+  prior_params:
+    kernel: iso
+    gamma: 1.0
+    context_freqs: 14
+  ema_params:
+    beta: 0.9999
+    update_after_step: 128
+    update_every: 1
+  iterations: 4
+  alpha: 0.005
+  noise_level: 0.5

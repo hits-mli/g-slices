@@ -1,0 +1,11 @@
+*.pyc
+.aim/*
+lightning_logs/*
+checkpoints/*
+__pycache__/
+logs/*
+*.cpython
+fast-hadamard-*
+scripts/*
+test.ipynb
+results/*.vscode/

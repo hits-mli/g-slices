@@ -1,0 +1,9 @@
+# @package _global_
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      experiment: gluonts_base
+      dataset: gluonts_best_slice/electricity_nips
+      model: tsflow_slice_best/electricity_nips
+      seed: 6432,6433,6434,6435,6436

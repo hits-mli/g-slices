@@ -1,0 +1,20 @@
+# @package _global_
+model_params:
+  freq: 6h
+  normalization: longmean
+  context_length: 8
+  prediction_length: 8
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+    use_data_mean: true
+    period_hours: 24
+dataset_params:
+  base_dataset: ett_small_1h
+  physical_prediction_hours: 48
+  num_batches_per_epoch: 128
+  batch_size: 64
+  subsample_params:
+    target_freq: 6h
+    hour: 0

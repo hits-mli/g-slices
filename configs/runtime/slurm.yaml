@@ -1,0 +1,14 @@
+# @package _global_
+runtime:
+  execution: slurm
+  logdir: ${oc.env:TSFLOW_LOGDIR,./logs}
+  conda_env: ${oc.env:TSFLOW_CONDA_ENV,}
+  write_resolved_config: true
+
+slurm:
+  sbatch_options:
+    partition: genoa-hopper.p
+    gres: gpu:1
+    cpus-per-task: 16
+    mem: 64G
+    time: "12:00:00"

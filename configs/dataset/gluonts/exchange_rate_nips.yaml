@@ -1,0 +1,14 @@
+# @package _global_
+model_params:
+  freq: B
+  normalization: longmean
+  context_length: 30
+  prediction_length: 30
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+dataset_params:
+  dataset: exchange_rate_nips
+  num_batches_per_epoch: 128
+  batch_size: 64

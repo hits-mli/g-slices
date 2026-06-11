@@ -1,0 +1,16 @@
+# @package _global_
+model_params:
+  freq: 1D
+  normalization: longmean
+  context_length: 30
+  prediction_length: 30
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+dataset_params:
+  dataset: wiki2000_nips
+  num_batches_per_epoch: 128
+  batch_size: 64
+evaluation_params:
+  max_eval_instances: 64

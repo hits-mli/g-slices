@@ -1,0 +1,16 @@
+# @package _global_
+model_params:
+  freq: 15min
+  normalization: longmean
+  context_length: 96
+  prediction_length: 96
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+    use_data_mean: true
+    period_hours: 24
+dataset_params:
+  dataset: ett_small_15min_pl96
+  num_batches_per_epoch: 128
+  batch_size: 64

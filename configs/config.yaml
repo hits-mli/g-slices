@@ -1,0 +1,5 @@
+defaults:
+  - experiment: gluonts_base
+  - _self_
+
+seed: 6432

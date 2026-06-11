@@ -1,0 +1,9 @@
+# @package _global_
+defaults:
+- /trainer: default
+- /model: tsflow_s4
+- /evaluation: default
+- /dataset: gluonts/electricity_nips
+- /runtime: local
+- _self_
+experiment_name: gluonts_base

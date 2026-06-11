@@ -1,0 +1,902 @@
+import warnings
+from collections.abc import Callable
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.utils._pytree as pytree
+from torch._higher_order_ops.associative_scan import generic_associative_scan
+
+
+class RMSNorm(nn.Module):
+    """A minimal RMSNorm used by the default SLiCELayer configuration."""
+
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.ones(d_model))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x * rms) * self.weight
+
+
+class SLiCE(nn.Module):
+    """
+    A structured linear controlled differential equation (SLiCE) recurrence.
+
+    Given a sequence of values (or increments) X_i in R^D for i=1,...,T, a SLiCE
+    recurrence computes a sequence of hidden states y_i in R^H for i=1,...,T via the
+    recurrence:
+        y_i = y_{i-1} + A(X_i) y_{i-1} + B(X_i)   for i=1,...,T,
+    where A: R^D -> R^{H x H} and B: R^D -> R^H are learnt linear functions and y_{0}
+    is learnt.
+
+    Args:
+        input_dim (int): Dimensionality of the input features at each time step.
+        hidden_dim (optional[int]): Dimensionality of the hidden state. If None, set to
+                                    input_dim.
+        bias (bool): If True, include the bias term B(X_i) in the recurrence.
+        block_size (int): The size of the blocks along the diagonal of A.
+        diagonal_dense (bool): If True, A is composed of a diagonal matrix and a single
+                               dense block of size block_size x block_size.
+        init_std (float): Standard deviation for vector field initialisation.
+        scale (float): Scaling factor applied to the input.
+        path_mode (str): Whether the input is treated as path values
+                         ("values", default) or as increments
+                         ("increments").
+        include_time_bias (bool): If True, always append a constant-one bias
+                                  channel in addition to the time/increment
+                                  channel. Defaults to False.
+        transition_mode (str): How the linear update is discretised.
+                               "euler" uses I + A(X_i), while
+                               "matrix_exp" uses exp(A(X_i)).
+
+    Shape:
+        - Input: (batch_size, seq_len, input_dim)
+        - Output: (batch_size, seq_len, hidden_dim)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: Optional[int] = None,
+        bias: bool = True,
+        block_size: int = 4,
+        diagonal_dense: bool = False,
+        init_std: float = 0.01,
+        scale: float = 1.0,
+        input_dependent_init: bool = False,
+        use_parallel: bool = True,
+        chunk_size: int = 256,
+        path_mode: str = "values",
+        include_time_bias: bool = False,
+        transition_mode: str = "euler",
+        bound_norm: bool = False,
+    ):
+        super().__init__()
+
+        if hidden_dim is None:
+            hidden_dim = input_dim
+        if path_mode not in {"values", "increments"}:
+            raise ValueError("path_mode must be one of {'values', 'increments'}.")
+        if transition_mode not in {"euler", "matrix_exp"}:
+            raise ValueError("transition_mode must be one of {'euler', 'matrix_exp'}.")
+        if block_size < 1:
+            raise ValueError("block_size must be at least 1.")
+        if not diagonal_dense and hidden_dim % block_size != 0:
+            raise ValueError("hidden_dim must be divisible by block_size.")
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.bias = bias
+        self.block_size = block_size
+        self.init_std = init_std
+        self.scale = scale
+        self.input_dependent_init = input_dependent_init
+        self.path_mode = path_mode
+        self.include_time_bias = include_time_bias
+        self.augmented_input_dim = self.input_dim + 1 + int(self.include_time_bias)
+        self.transition_mode = transition_mode
+        self.bound_norm = bound_norm
+        self.use_parallel = use_parallel
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1.")
+        self.chunk_size = int(chunk_size)
+        if self.use_parallel:
+            if generic_associative_scan is None:
+                warnings.warn(
+                    "use_parallel=True requested, "
+                    "but torch.associative_scan is unavailable. "
+                    "Falling back to recurrent mode.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self.use_parallel = False
+            elif self.block_size >= 64 and hidden_dim >= 128:
+                warnings.warn(
+                    "Parallel mode may be slower than recurrent mode for large "
+                    f"block_size ({self.block_size}) and hidden_dim ({hidden_dim}). "
+                    "Consider setting use_parallel=False "
+                    "if throughput regresses.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        if diagonal_dense and self.block_size == self.hidden_dim:
+            self.diagonal_dense = (
+                False  # No point in diagonal + dense if only one block
+            )
+        elif diagonal_dense and self.block_size == 1:
+            self.diagonal_dense = False  # No point in diagonal + dense if no dense part
+        else:
+            self.diagonal_dense = diagonal_dense
+
+        # Define learnt initial hidden state y_0
+        if self.input_dependent_init:
+            self.init = nn.Linear(self.input_dim, self.hidden_dim)
+            nn.init.normal_(self.init.weight, mean=0.0, std=self.init_std)
+            if self.init.bias is not None:
+                nn.init.zeros_(self.init.bias)
+        else:
+            self.init = torch.nn.Parameter(torch.randn(self.hidden_dim) * self.init_std)
+
+        if self.diagonal_dense:
+            # For diagonal + dense block structure, define separate parameters
+            # for the diagonal and dense parts.
+            self.vf_A_diag = nn.Linear(
+                self.augmented_input_dim, self.hidden_dim - self.block_size, bias=False
+            )
+            self.vf_A_dense = nn.Linear(
+                self.augmented_input_dim, self.block_size * self.block_size, bias=False
+            )
+            nn.init.normal_(self.vf_A_diag.weight, mean=0.0, std=self.init_std)
+            nn.init.normal_(
+                self.vf_A_dense.weight,
+                mean=0.0,
+                std=self.init_std / (self.block_size**0.5),
+            )
+        else:
+            # Define the vector field A as a linear layer
+            self.vf_A = nn.Linear(
+                self.augmented_input_dim, self.hidden_dim * self.block_size, bias=False
+            )
+            nn.init.normal_(
+                self.vf_A.weight,
+                mean=0.0,
+                std=self.init_std / (self.block_size**0.5),
+            )
+
+        if bias:
+            self.vf_B = nn.Linear(self.augmented_input_dim, self.hidden_dim, bias=False)
+            nn.init.normal_(self.vf_B.weight, mean=0.0, std=self.init_std)
+
+    def _prepare_driving_path(self, x: torch.Tensor) -> torch.Tensor:
+        if self.path_mode == "values":
+            return torch.diff(
+                x,
+                dim=1,
+                prepend=torch.zeros_like(x[:, :1, :]),
+            )
+        return x
+
+    def _prepare_augmented_inputs(self, x: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        path = self._prepare_driving_path(x)
+        if t is not None:
+            if self.path_mode == "values":
+                time_channel = torch.diff(
+                    t, dim=1, prepend=t[:, :1, :]
+                )
+            else:
+                time_channel = t
+        else:
+            time_channel = torch.ones(
+                path.shape[0], path.shape[1], 1, device=x.device, dtype=x.dtype
+            )
+        if self.include_time_bias:
+            bias_channel = torch.ones_like(time_channel)
+            aux = torch.cat((bias_channel, time_channel), dim=-1)
+        else:
+            aux = time_channel
+        return torch.cat((aux, path), dim=-1) * self.scale
+
+    def _bound_operator_norm(self, M: torch.Tensor, iterations: int = 5, max_norm: float = 1.0) -> torch.Tensor:
+        """
+        Bounds the operator norm (largest singular value) of the discretized matrices
+        using power iteration. This ensures the dynamics are non-expansive.
+        """
+        h = M.shape[-1]
+        M_flat = M.view(-1, h, h)
+        batch_size = M_flat.shape[0]
+
+        # Initialize random vector v: (batch_size, h, 1)
+        v = torch.randn(batch_size, h, 1, device=M.device, dtype=M.dtype)
+        v = torch.nn.functional.normalize(v, dim=1)
+
+        # Power iteration to estimate dominant right singular vector
+        for _ in range(iterations):
+            # v <- M^T M v
+            u = torch.bmm(M_flat, v)
+            v = torch.bmm(M_flat.transpose(1, 2), u)
+            v = torch.nn.functional.normalize(v, dim=1)
+
+        # Estimate singular value sigma = ||Mv||
+        u = torch.bmm(M_flat, v)
+        sigma = torch.norm(u, dim=1, keepdim=True)  # (batch_size, 1, 1)
+        
+        # Reshape sigma back to broadcast
+        sigma = sigma.view(*M.shape[:-2], 1, 1)
+
+        # Scale down if sigma > max_norm
+        scale = torch.clamp(sigma / max_norm, min=1.0)
+        return M / scale
+
+    def _discretize_diagonal(self, A: torch.Tensor) -> torch.Tensor:
+        if self.transition_mode == "matrix_exp":
+            M = torch.exp(A)
+        else:
+            M = 1.0 + A
+        
+        if self.bound_norm:
+            # Exact max singular value for purely diagonal matrix
+            sigma = torch.abs(M)
+            scale = torch.clamp(sigma / 1.0, min=1.0)
+            M = M / scale
+            
+        return M
+
+    def _discretize_matrix(self, A: torch.Tensor) -> torch.Tensor:
+        if self.transition_mode == "matrix_exp":
+            M = torch.matrix_exp(A)
+        else:
+            eye = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
+            eye = eye.view(*((1,) * (A.ndim - 2)), A.shape[-2], A.shape[-1])
+            M = eye + A
+            
+        if self.bound_norm:
+            M = self._bound_operator_norm(M, max_norm=1.0)
+            
+        return M
+
+    def _build_elementwise_transform(
+        self, inp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        A = self.vf_A(inp)
+        M = self._discretize_diagonal(A)
+        if self.bias:
+            b = self.vf_B(inp)
+        else:
+            b = torch.zeros_like(M)
+        return M, b
+
+    def _build_blockdiag_transform(
+        self, inp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz = self.block_size
+        nblocks = self.hidden_dim // bsz
+
+        A = self.vf_A(inp).view(*inp.shape[:-1], nblocks, bsz, bsz)
+        M = self._discretize_matrix(A)
+        if self.bias:
+            b = self.vf_B(inp).view(*inp.shape[:-1], nblocks, bsz)
+        else:
+            b = torch.zeros(
+                *inp.shape[:-1],
+                nblocks,
+                bsz,
+                device=inp.device,
+                dtype=inp.dtype,
+            )
+        return M, b
+
+    def _build_diagonal_dense_transform(
+        self, inp: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        bsz = self.block_size
+        hdiag = self.hidden_dim - bsz
+
+        A_diag = self.vf_A_diag(inp)
+        M_diag = self._discretize_diagonal(A_diag)
+
+        A_dense = self.vf_A_dense(inp).view(*inp.shape[:-1], bsz, bsz)
+        M_dense = self._discretize_matrix(A_dense)
+
+        if self.bias:
+            B = self.vf_B(inp)
+            b_diag = B[..., :hdiag]
+            b_dense = B[..., hdiag:]
+        else:
+            b_diag = torch.zeros_like(M_diag)
+            b_dense = torch.zeros(
+                *inp.shape[:-1],
+                bsz,
+                device=inp.device,
+                dtype=inp.dtype,
+            )
+
+        return M_diag, M_dense, b_diag, b_dense
+
+    # ---- scan kernels: block_size == 1 (elementwise) ----
+
+    def _scan_kernels_elementwise(self) -> tuple[Callable, Callable, Callable]:
+        def build(inp_chunk: torch.Tensor):
+            return self._build_elementwise_transform(inp_chunk)
+
+        def combine(lhs, rhs):
+            # Composition: rhs ∘ lhs
+            M_l, b_l = lhs
+            M_r, b_r = rhs
+            M = M_r * M_l
+            b = M_r * b_l + b_r
+            return (M, b)
+
+        def apply(prefix, y0: torch.Tensor):
+            M, b = prefix  # (B, C, H)
+            return M * y0.unsqueeze(1) + b
+
+        return combine, build, apply
+
+    # ---- scan kernels: block diagonal (block_size > 1, not diagonal_dense) ----
+
+    def _scan_kernels_blockdiag(self) -> tuple[Callable, Callable, Callable]:
+        bsz = self.block_size
+        nblocks = self.hidden_dim // bsz
+
+        def build(inp_chunk: torch.Tensor):
+            return self._build_blockdiag_transform(inp_chunk)
+
+        def combine(lhs, rhs):
+            M_l, b_l = lhs
+            M_r, b_r = rhs
+            M = torch.einsum("...ij,...jk->...ik", M_r, M_l)
+            b = torch.einsum("...ij,...j->...i", M_r, b_l) + b_r
+            return (M, b)
+
+        def apply(prefix, y0: torch.Tensor):
+            M, b = prefix  # M: (B,C,nblocks,b,b), b: (B,C,nblocks,b)
+            y0b = y0.view(y0.shape[0], nblocks, bsz)
+            y = torch.einsum("bcnij,bnj->bcni", M, y0b) + b
+            return y.reshape(y.shape[0], y.shape[1], self.hidden_dim)
+
+        return combine, build, apply
+
+    # ---- scan kernels: diagonal + one dense block ----
+
+    def _scan_kernels_diagonal_dense(self) -> tuple[Callable, Callable, Callable]:
+        bsz = self.block_size
+        h = self.hidden_dim
+        hdiag = h - bsz
+
+        def build(inp_chunk: torch.Tensor):
+            return self._build_diagonal_dense_transform(inp_chunk)
+
+        def combine(lhs, rhs):
+            Md_l, Mdense_l, bd_l, bdense_l = lhs
+            Md_r, Mdense_r, bd_r, bdense_r = rhs
+
+            Md = Md_r * Md_l
+            bd = Md_r * bd_l + bd_r
+
+            Mdense = torch.einsum("...ij,...jk->...ik", Mdense_r, Mdense_l)
+            bdense = torch.einsum("...ij,...j->...i", Mdense_r, bdense_l) + bdense_r
+
+            return (Md, Mdense, bd, bdense)
+
+        def apply(prefix, y0: torch.Tensor):
+            Md, Mdense, bd, bdense = prefix
+
+            y_diag0 = y0[:, :hdiag]
+            y_dense0 = y0[:, hdiag:]
+
+            y_diag = Md * y_diag0.unsqueeze(1) + bd
+
+            y_dense = torch.einsum("bcij,bj->bci", Mdense, y_dense0) + bdense
+
+            return torch.cat([y_diag, y_dense], dim=-1)
+
+        return combine, build, apply
+
+    def forward(self, X: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Run either recurrent or parallel chunked scan based on constructor settings.
+
+        Args:
+            X: (batch, seq, input_dim)
+        """
+        if not self.use_parallel:
+            return self._forward_recurrent(X, t)
+
+        return self._forward_parallel(X, self.chunk_size, t)
+
+    @staticmethod
+    def _generic_associative_scan(combine_fn: Callable, xs, dim: int):
+        leaves, spec = pytree.tree_flatten(xs)
+        vmapped_combine_fn = torch.vmap(
+            combine_fn,
+            in_dims=(
+                pytree.tree_unflatten([dim] * len(leaves), spec),
+                pytree.tree_unflatten([dim] * len(leaves), spec),
+            ),
+            out_dims=dim,
+        )
+
+        def flat_operator(*args):
+            num_leaves = len(leaves)
+            lhs = pytree.tree_unflatten(args[:num_leaves], spec)
+            rhs = pytree.tree_unflatten(args[num_leaves:], spec)
+            return pytree.tree_leaves(vmapped_combine_fn(lhs, rhs))
+
+        result_flat = generic_associative_scan(flat_operator, leaves, dim)
+        return pytree.tree_unflatten(result_flat, spec)
+
+    # -------------------------
+    # Recurrent implementation
+    # -------------------------
+
+    def _forward_recurrent(self, X: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        batch_size, seq_len, in_dim = X.shape
+
+        inp = self._prepare_augmented_inputs(X, t)
+
+        # Initialise the hidden state
+        if self.input_dependent_init:
+            y = self.init(X[:, 0, :])  # shape: (batch_size, hidden_dim)
+        else:
+            y = self.init.unsqueeze(0).expand(
+                batch_size, -1
+            )  # shape: (batch_size, hidden_dim)
+
+        # Prepare a tensor to store all hidden states
+        ys = torch.zeros(
+            batch_size, seq_len, self.hidden_dim, device=X.device, dtype=X.dtype
+        )
+
+        # Recurrently compute the hidden states
+        for i in range(seq_len):
+            if self.diagonal_dense:
+                y_diag = y[:, : -self.block_size]
+                y_dense = y[:, -self.block_size :]
+                M_diag, M_dense, b_diag, b_dense = self._build_diagonal_dense_transform(
+                    inp[:, i]
+                )
+                y_diag = M_diag * y_diag + b_diag
+                y_dense = (
+                    torch.matmul(M_dense, y_dense.unsqueeze(-1)).squeeze(-1) + b_dense
+                )
+                y = torch.cat([y_diag, y_dense], dim=1)
+            elif self.block_size > 1:
+                M, b = self._build_blockdiag_transform(inp[:, i])
+                y = torch.matmul(
+                    M,
+                    y.view(
+                        -1,
+                        self.hidden_dim // self.block_size,
+                        self.block_size,
+                        1,
+                    ),
+                ).view(-1, self.hidden_dim) + b.view(-1, self.hidden_dim)
+            else:
+                M, b = self._build_elementwise_transform(inp[:, i])
+                y = M * y + b
+            ys[:, i] = y
+
+        return ys
+
+    # -------------------------
+    # Parallel chunked scan
+    # -------------------------
+
+    def _forward_parallel(self, X: torch.Tensor, chunk_size: int, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Chunked parallel forward using torch.associative_scan (generic).
+
+        Each step defines an affine transform:
+            y_i = M_i y_{i-1} + b_i,
+            where M_i is either I + A_i or exp(A_i), and b_i = B_i
+        We scan-combine transforms within each chunk, then apply prefixes
+        to chunk-start state.
+        """
+        batch_size, seq_len, _ = X.shape
+
+        inp = self._prepare_augmented_inputs(X, t)
+
+        if self.input_dependent_init:
+            y_start = self.init(X[:, 0, :])
+        else:
+            y_start = self.init.unsqueeze(0).expand(batch_size, -1)
+
+        ys = torch.empty(
+            batch_size, seq_len, self.hidden_dim, device=X.device, dtype=X.dtype
+        )
+
+        if self.diagonal_dense:
+            combine_fn, build_fn, apply_fn = self._scan_kernels_diagonal_dense()
+        elif self.block_size > 1:
+            combine_fn, build_fn, apply_fn = self._scan_kernels_blockdiag()
+        else:
+            combine_fn, build_fn, apply_fn = self._scan_kernels_elementwise()
+
+        for start in range(0, seq_len, chunk_size):
+            end = min(seq_len, start + chunk_size)
+            inp_chunk = inp[:, start:end, :]  # (B, C, augmented_input_dim)
+
+            transforms = build_fn(
+                inp_chunk
+            )  # pytree of tensors with leading (B, C, ...)
+            prefix_transforms = self._generic_associative_scan(
+                combine_fn,
+                transforms,
+                dim=1,
+            )
+
+            y_chunk = apply_fn(prefix_transforms, y_start)  # (B, C, H)
+            ys[:, start:end, :] = y_chunk
+            y_start = y_chunk[:, -1, :]
+
+        return ys
+
+
+class SLiCELayer(nn.Module):
+    """
+    A residual layer wrapping a SLiCE.
+
+    SLiCELayer defaults to this structure:
+      1. RMSNorm
+      2. SLiCE
+      3. Residual connection
+      4. RMSNorm
+      5. Token MLP with hidden size ff_mult * input_dim and GELU
+      6. Residual connection
+      7. Dropout on each residual branch
+
+    Optional toggle for the post-norm wrapper:
+      - prenorm=False
+
+    Optional toggles for the LayerNorm + GLU/tanh single-stage wrapper:
+      - norm_type="layernorm"
+      - ff_style="single"
+      - ff_mult=1
+      - ff_activation="glu" or "tanh"
+      - dropout_position="output"
+
+    The output dimension of the SLiCE is the same as the input dimension to preserve
+    shape for the residual.
+
+    Args:
+        input_dim (int): Dimensionality of the input (and thus output) features.
+        block_size (int): The size of the blocks along the diagonal of A in the SLiCE.
+        diagonal_dense (bool): If True, A is composed of a diagonal matrix and a dense
+                               block.
+        init_std (float): Standard deviation for weight initialisation in the SLiCE.
+        use_parallel (bool): Whether the inner SLiCE uses parallel scan execution.
+        chunk_size (int): Chunk size used by the inner SLiCE when in parallel mode.
+        dropout_rate (float): Dropout probability applied either on residual branches
+                              or on the block output, depending on dropout_position.
+        path_mode (str): How the inner SLiCE interprets the input path.
+        include_time_bias (bool): Whether the inner SLiCE appends a constant
+                                  bias channel alongside the time/increment
+                                  channel.
+        transition_mode (str): How the inner SLiCE discretises each update.
+        norm_type (str): "rmsnorm" or "layernorm". Defaults to "rmsnorm".
+        prenorm (bool): If True, apply normalisation before the SLiCE and
+                        feedforward branches; if False, use post-residual
+                        normalisation.
+        second_norm (bool): If True, apply the second normalisation around the
+                            feedforward branch; if False, skip that
+                            normalisation.
+        ff_style (str): "mlp" for Linear -> activation -> Linear, or
+                        "single" for a single Linear -> activation branch.
+        ff_activation (str): "gelu", "glu", or "tanh".
+        ff_mult (int): Expansion factor for the hidden feedforward size.
+        dropout_position (str): "residual" to drop branch outputs before
+                                residual addition, or "output" to drop the
+                                final layer output.
+        norm_eps (float): Epsilon used by the normalisation layers.
+
+    Shape:
+        - Input: (batch_size, seq_len, input_dim)
+        - Output: (batch_size, seq_len, input_dim)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        bias: bool = True,
+        block_size: int = 4,
+        diagonal_dense: bool = False,
+        init_std: float = 0.01,
+        scale: float = 1.0,
+        input_dependent_init: bool = False,
+        use_parallel: bool = True,
+        chunk_size: int = 256,
+        dropout_rate: float = 0.01,
+        path_mode: str = "values",
+        include_time_bias: bool = False,
+        transition_mode: str = "euler",
+        norm_type: str | None = "rmsnorm",
+        prenorm: bool = True,
+        second_norm: bool = True,
+        ff_style: str = "mlp",
+        ff_activation: str = "gelu",
+        ff_mult: int = 4,
+        dropout_position: str = "residual",
+        norm_eps: float = 1e-6,
+        bound_norm: bool = False,
+    ):
+        super().__init__()
+        if isinstance(norm_type, str) and norm_type.lower() == "none":
+            norm_type = None
+        if norm_type is not None and norm_type not in {"rmsnorm", "layernorm"}:
+            raise ValueError("norm_type must be one of {'rmsnorm', 'layernorm', 'none'} or None.")
+        if ff_style not in {"mlp", "single"}:
+            raise ValueError("ff_style must be one of {'mlp', 'single'}.")
+        if ff_activation not in {"gelu", "glu", "tanh"}:
+            raise ValueError("ff_activation must be one of {'gelu', 'glu', 'tanh'}.")
+        if ff_mult < 1:
+            raise ValueError("ff_mult must be at least 1.")
+        if ff_style == "single" and ff_mult != 1:
+            raise ValueError("ff_mult must be 1 when ff_style='single'.")
+        if dropout_position not in {"residual", "output"}:
+            raise ValueError("dropout_position must be one of {'residual', 'output'}.")
+
+        self.norm_type = norm_type
+        self.prenorm = prenorm
+        self.second_norm = second_norm
+        self.ff_style = ff_style
+        self.ff_activation = ff_activation
+        self.ff_mult = ff_mult
+        self.dropout_position = dropout_position
+        self.slice = SLiCE(
+            input_dim=input_dim,
+            hidden_dim=None,
+            bias=bias,
+            block_size=block_size,
+            diagonal_dense=diagonal_dense,
+            init_std=init_std,
+            scale=scale,
+            input_dependent_init=input_dependent_init,
+            use_parallel=use_parallel,
+            chunk_size=chunk_size,
+            path_mode=path_mode,
+            include_time_bias=include_time_bias,
+            transition_mode=transition_mode,
+            bound_norm=bound_norm,
+        )
+
+        self.drop = nn.Dropout(p=dropout_rate)
+        if norm_type is None:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity() if second_norm else None
+        else:
+            norm_cls = RMSNorm if norm_type == "rmsnorm" else nn.LayerNorm
+            self.norm1 = norm_cls(input_dim, eps=norm_eps)
+            self.norm2 = norm_cls(input_dim, eps=norm_eps) if second_norm else None
+
+        ff_hidden_dim = ff_mult * input_dim
+        ff_in_dim = 2 * ff_hidden_dim if ff_activation == "glu" else ff_hidden_dim
+        if ff_activation == "gelu":
+            activation = nn.GELU()
+        elif ff_activation == "glu":
+            activation = nn.GLU(dim=-1)
+        else:
+            activation = nn.Tanh()
+
+        if ff_style == "mlp":
+            self.token_mlp = nn.Sequential(
+                nn.Linear(input_dim, ff_in_dim),
+                activation,
+                nn.Linear(ff_hidden_dim, input_dim),
+            )
+        else:
+            self.token_mlp = nn.Sequential(
+                nn.Linear(input_dim, ff_in_dim),
+                activation,
+            )
+
+    def forward(self, X: torch.Tensor, t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass for a configurable SLiCELayer.
+
+        Args:
+            X (torch.Tensor): shape (batch_size, seq_len, input_dim)
+
+        Returns:
+            torch.Tensor: shape (batch_size, seq_len, input_dim)
+        """
+        if self.prenorm:
+            slice_out = self.slice(self.norm1(X), t)
+            if self.dropout_position == "residual":
+                slice_out = self.drop(slice_out)
+            X = X + slice_out
+
+            ff_input = self.norm2(X) if self.norm2 is not None else X
+            ff_out = self.token_mlp(ff_input)
+            if self.dropout_position == "residual":
+                ff_out = self.drop(ff_out)
+            X = X + ff_out
+
+            if self.dropout_position == "output":
+                X = self.drop(X)
+            return X
+
+        slice_out = self.slice(X, t)
+        if self.dropout_position == "residual":
+            slice_out = self.drop(slice_out)
+        X = self.norm1(X + slice_out)
+
+        ff_out = self.token_mlp(X)
+        if self.dropout_position == "residual":
+            ff_out = self.drop(ff_out)
+        X = X + ff_out
+        if self.norm2 is not None:
+            X = self.norm2(X)
+
+        if self.dropout_position == "output":
+            X = self.drop(X)
+        return X
+
+
+class StackedSLiCE(nn.Module):
+    """
+    Stacks multiple SLiCELayers, preceded by an embedding layer and followed by a
+    final linear layer.
+
+    Args:
+        num_layers (int): Number of SLiCELayers to stack.
+        data_dim (int): Dimension of the input.
+        hidden_dim (int): Hidden dimension used in each SLiCELayer.
+        label_dim (int | tuple[int, ...]): Size of the output dimension,
+                                           tuple of int for multi-head).
+        block_size (int): The size of the blocks along the diagonal of A in each layer.
+        diagonal_dense (bool): If True, A is composed of a diagonal matrix and a dense
+                               block in each layer.
+        init_std (float): Standard deviation for the initialisation in each layer.
+        use_parallel (bool): Whether each layer's inner SLiCE uses
+                             parallel scan execution.
+        chunk_size (int): Chunk size used by each layer's inner SLiCE in parallel mode.
+        dropout_rate (float): Dropout probability applied in each layer.
+        path_mode (str): How each inner SLiCE interprets its input path.
+        include_time_bias (bool): Whether each inner SLiCE appends a
+                                  constant bias channel alongside the
+                                  time/increment channel.
+        transition_mode (str): How each inner SLiCE discretises each update.
+        norm_type (str): "rmsnorm" or "layernorm" for each stacked layer.
+        prenorm (bool): Whether each stacked layer uses pre-norm.
+        second_norm (bool): Whether each stacked layer uses the second
+                            normalisation around the feedforward branch.
+        ff_style (str): "mlp" or "single" feedforward branch shape.
+        ff_activation (str): "gelu", "glu", or "tanh".
+        ff_mult (int): Expansion factor for the feedforward hidden size.
+        dropout_position (str): "residual" or "output".
+        norm_eps (float): Epsilon used by the normalisation layers.
+
+    Shape:
+        - Input: (batch_size, seq_len) if the input is tokens or
+                 (batch_size, seq_len, data_dim) if the input is time-series values.
+        - Output: (batch_size, seq_len, label_dim) for scalar label_dim, or
+                 list[(batch_size, seq_len, d)] for tuple label_dim.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        data_dim: int,
+        hidden_dim: int,
+        label_dim: int | tuple[int, ...],
+        bias: bool = True,
+        tokens: bool = True,
+        block_size: int = 4,
+        diagonal_dense: bool = False,
+        init_std: float = 0.01,
+        scale: float = 1.0,
+        input_dependent_init: bool = False,
+        use_parallel: bool = True,
+        chunk_size: int = 256,
+        dropout_rate: float = 0.01,
+        path_mode: str = "values",
+        include_time_bias: bool = False,
+        transition_mode: str = "euler",
+        norm_type: str | None = "rmsnorm",
+        prenorm: bool = True,
+        second_norm: bool = True,
+        ff_style: str = "mlp",
+        ff_activation: str = "gelu",
+        ff_mult: int = 4,
+        dropout_position: str = "residual",
+        norm_eps: float = 1e-6,
+        bound_norm: bool = False,
+    ):
+        super().__init__()
+        self.tokens = tokens
+        if self.tokens:
+            self.embedding = nn.Embedding(data_dim, hidden_dim)
+        else:
+            self.embedding = nn.Linear(data_dim, hidden_dim)
+
+        # Build stacked SLiCE layers.
+        self.layers = nn.ModuleList(
+            [
+                SLiCELayer(
+                    input_dim=hidden_dim,
+                    bias=bias,
+                    block_size=block_size,
+                    diagonal_dense=diagonal_dense,
+                    init_std=init_std,
+                    scale=scale,
+                    input_dependent_init=input_dependent_init,
+                    use_parallel=use_parallel,
+                    chunk_size=chunk_size,
+                    dropout_rate=dropout_rate,
+                    path_mode=path_mode,
+                    include_time_bias=include_time_bias,
+                    transition_mode=transition_mode,
+                    norm_type=norm_type,
+                    prenorm=prenorm,
+                    second_norm=second_norm,
+                    ff_style=ff_style,
+                    ff_activation=ff_activation,
+                    ff_mult=ff_mult,
+                    dropout_position=dropout_position,
+                    norm_eps=norm_eps,
+                    bound_norm=bound_norm,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        # Final projection: from hidden_dim -> label_dim
+        self.label_dim = label_dim
+        if isinstance(label_dim, int):
+            self.linear = nn.Linear(hidden_dim, label_dim)
+        elif isinstance(label_dim, tuple):
+            assert all(isinstance(x, int) for x in label_dim)
+            self.linear = nn.ModuleList([nn.Linear(hidden_dim, d) for d in label_dim])
+        else:
+            raise TypeError("label_dim must be int or tuple of int")
+
+    def hidden(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of the stacked model without final linear projection:
+            1. Embed input X
+            2. Pass through each SLiCE layer
+
+        Args:
+            X (torch.Tensor): If tokens, shape (batch_size, seq_len)
+                              If time-series, shape (batch_size, seq_len, data_dim)
+
+        Returns:
+            torch.Tensor: shape (batch_size, seq_len, hidden_dim)
+        """
+        # Step 1: Embedding
+        if self.tokens:
+            X = self.embedding(X.long())
+        else:
+            X = self.embedding(X.float())
+
+        # Step 2: Pass through each stacked layer.
+        for layer in self.layers:
+            X = layer(X)  # (batch_size, seq_len, hidden_dim)
+
+        return X
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor | list[torch.Tensor]:
+        """
+        Forward pass of the stacked model:
+            1. Embed input X
+            2. Pass through each SLiCE layer
+            3. Apply final linear projection
+
+        Args:
+            X (torch.Tensor): If tokens, shape (batch_size, seq_len)
+                              If time-series, shape (batch_size, seq_len, data_dim)
+
+        Returns:
+            torch.Tensor | list[torch.Tensor]: tensor output for scalar label_dim,
+            or one tensor per head when label_dim is a tuple.
+        """
+        X = self.hidden(X)
+
+        # Step 3: Project to label_dim
+        if isinstance(self.linear, nn.ModuleList):
+            return [head(X) for head in self.linear]
+        return self.linear(X)

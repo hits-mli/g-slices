@@ -1,0 +1,14 @@
+# @package _global_
+model_params:
+  freq: H
+  normalization: longmean
+  context_length: 24
+  prediction_length: 24
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+dataset_params:
+  dataset: electricity_nips
+  num_batches_per_epoch: 128
+  batch_size: 64

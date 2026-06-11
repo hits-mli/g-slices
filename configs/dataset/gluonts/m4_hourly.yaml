@@ -1,0 +1,14 @@
+# @package _global_
+model_params:
+  freq: H
+  normalization: longmean
+  context_length: 48
+  prediction_length: 48
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 7
+dataset_params:
+  dataset: m4_hourly
+  num_batches_per_epoch: 128
+  batch_size: 64

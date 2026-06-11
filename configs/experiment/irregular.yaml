@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+- /trainer: tsflow_lr1e-4
+- /model: tsflow_s4
+- /evaluation: irregular
+- /dataset: irregular/ett_15min_k10_24h
+- /runtime: local
+- _self_
+experiment_name: irregular
+model_params:
+  use_lags: false
+  backbone_params:
+    hidden_dim: 16
+    bidirectional: false
+    slice_block_params:
+      block_size: 1
+      bound_norm: true
+      include_time_bias: true

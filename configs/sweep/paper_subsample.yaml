@@ -1,0 +1,8 @@
+# @package _global_
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      experiment: subsample
+      dataset: subsample/ett_1h_native_48h,subsample/ett_1h_6h_48h,subsample/ett_1h_12h_48h,subsample/ett_1h_daily_48h,subsample/ett_15min_native_24h,subsample/ett_15min_hourly_24h
+      seed: 6432

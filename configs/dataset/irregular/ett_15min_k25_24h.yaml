@@ -1,0 +1,30 @@
+# @package _global_
+model_params:
+  freq: 15min
+  normalization: longmean
+  gp_time_mode: continuous
+  prior_params:
+    kernel: ou
+    gamma: 1.0
+    context_freqs: 14
+    use_data_mean: true
+    period_hours: 24
+  gp_fit_context_only: false
+dataset_params:
+  base_dataset: ett_small_15min_pl96
+  num_batches_per_epoch: 128
+  batch_size: 64
+  fine_to_coarse_eval_adapter: none
+  irregular_grid_params:
+    base_freq: 15min
+    context_physical_hours: 24
+    prediction_physical_hours: 24
+    num_context_points: 12
+    num_prediction_points: 12
+    sampler: gamma
+    gamma_k: 25
+    include_region_endpoints: true
+    per_instance: true
+    seed_offset: 0
+evaluation_params:
+  train_plot_every: 0

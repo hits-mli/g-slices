@@ -1,0 +1,8 @@
+# @package _global_
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      experiment: gluonts_base
+      dataset: gluonts/exchange_rate_nips,gluonts/solar_nips,gluonts/electricity_nips,gluonts/traffic_nips,gluonts/uber_tlc_hourly,gluonts/wiki2000_nips,gluonts/kdd_cup_2018_without_missing,gluonts/m4_hourly,gluonts/ett_small_1h,gluonts/ett_small_15min,gluonts/solar_10_minutes,gluonts/solar_weekly,gluonts/electricity_weekly,gluonts/uber_tlc_daily,gluonts/m4_daily,gluonts/m4_weekly,gluonts/m4_monthly,gluonts/m4_quarterly,gluonts/m4_yearly
+      seed: 6432

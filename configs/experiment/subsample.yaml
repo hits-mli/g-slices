@@ -1,0 +1,10 @@
+# @package _global_
+defaults:
+- /trainer: default
+- /model: tsflow_s4
+- /evaluation: default
+- /dataset: subsample/ett_1h_daily_48h
+- /runtime: local
+- _self_
+experiment_name: subsample
+model_params: {}

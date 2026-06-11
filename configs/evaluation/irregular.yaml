@@ -1,0 +1,9 @@
+# @package _global_
+evaluation_params:
+  num_samples: 16
+  use_validation_set: true
+  eval_every: 50
+  max_eval_instances: 16
+  max_show: 8
+  do_final_eval: true
+  train_plot_every: 0

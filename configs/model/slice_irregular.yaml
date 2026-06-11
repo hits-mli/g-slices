@@ -1,0 +1,35 @@
+# @package _global_
+model: conditional
+setting: univariate
+model_params:
+  gp_fit_context_only: false
+  backbone_params:
+    input_dim: 1
+    output_dim: 1
+    step_emb: 64
+    bidirectional: false
+    num_residual_blocks: 3
+    residual_block: slice
+    slice_block_params:
+      block_size: 1
+      diagonal_dense: false
+      bound_norm: true
+      include_time_bias: true
+    hidden_dim: 16
+    dropout: 0.0
+    init_skip: false
+    feature_skip: true
+  num_steps: 32
+  solver: euler
+  device: cuda:0
+  optimizer_params:
+    lr: 0.0001
+    weight_decay: 0.0
+  ema_params:
+    beta: 0.9999
+    update_after_step: 128
+    update_every: 1
+  gp_time_mode: continuous
+  matching: random
+  use_ema: true
+  use_lags: false

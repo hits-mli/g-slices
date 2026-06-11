@@ -1,0 +1,5 @@
+# @package _global_
+runtime:
+  execution: local
+  logdir: ./logs
+  write_resolved_config: true

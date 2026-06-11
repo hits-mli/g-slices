@@ -1,0 +1,8 @@
+# @package _global_
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      experiment: irregular
+      dataset: irregular/ett_15min_k1_24h,irregular/ett_15min_k3_24h,irregular/ett_15min_k5_24h,irregular/ett_15min_k10_24h,irregular/ett_15min_k25_24h,irregular/ett_15min_k50_24h,irregular/ett_15min_k100_24h,irregular/ett_15min_k1000_24h
+      seed: 6432
