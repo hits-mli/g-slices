@@ -41,7 +41,7 @@ from gslice.irregular import (
     PAST_TIME_GRID_FIELD,
     get_irregular_grid_spec,
 )
-from gslice.model import TSFlowCond
+from gslice.model import TSDiffCond, TSFlowCond
 from gslice.utils import create_transforms
 from gslice.utils.transforms import IrregularInstanceTransform
 from gslice.utils.util import (
@@ -66,7 +66,17 @@ pykeops.set_build_folder(temp_build_folder)
 def create_model(setting, target_dim, model_params):
     if setting != "univariate":
         raise ValueError(f"Unsupported setting {setting!r}; only 'univariate' is supported.")
-    model = TSFlowCond(
+    # Presence of diffusion_params selects the DSPD model. The two classes have
+    # identical state-dict layouts, so this dispatch is the only thing standing
+    # between a tsdiff checkpoint and silently sampling it with the flow ODE.
+    diffusion_params = model_params.get("diffusion_params")
+    if diffusion_params is not None:
+        model_cls = TSDiffCond
+        extra_kwargs = {"diffusion_params": diffusion_params}
+    else:
+        model_cls = TSFlowCond
+        extra_kwargs = {}
+    model = model_cls(
         setting=setting,
         target_dim=target_dim,
         context_length=model_params["context_length"],
@@ -87,6 +97,7 @@ def create_model(setting, target_dim, model_params):
         lags_seq=model_params.get("lags_seq"),
         prior_context_length_override=model_params.get("prior_context_length_override"),
         gp_fit_context_only=model_params.get("gp_fit_context_only", False),
+        **extra_kwargs,
     )
     model.to(model_params["device"])
     return model
@@ -391,6 +402,35 @@ def evaluate_conditional(
     return results
 
 
+def _maybe_compile_backbone(model, model_params, uses_irregular_grid):
+    """Optionally ``torch.compile`` the backbone in place (opt-in via
+    ``model_params['compile']``).
+
+    Only the backbone is compiled, not the LightningModule: the GP-prior path uses
+    pykeops/KeOps, which does not trace. Compilation is skipped on irregular grids
+    because the largest win — ``mode='reduce-overhead'`` (CUDA graphs) — requires
+    static shapes. The in-place ``nn.Module.compile`` is used so ``state_dict`` keys
+    are unchanged and checkpoint save/load stay compatible (see the ``strict=True``
+    reload after ``trainer.fit``).
+
+    ``compile`` may be falsy (off), ``True`` (→ ``'reduce-overhead'``), or a string
+    naming the compile mode (e.g. ``'default'`` if CUDA graphs misbehave).
+    """
+    compile_opt = model_params.get("compile", False)
+    if not compile_opt:
+        return
+    if uses_irregular_grid:
+        logging.info("compile requested but grid is irregular (variable shapes) → skipping.")
+        return
+    backbone = getattr(model, "backbone", None)
+    if backbone is None:
+        logging.info("compile requested but model has no `backbone` attribute → skipping.")
+        return
+    mode = "reduce-overhead" if compile_opt is True else str(compile_opt)
+    logging.info(f"Compiling backbone in place with torch.compile(mode={mode!r}).")
+    backbone.compile(mode=mode)
+
+
 def main(
     model,
     setting,
@@ -573,6 +613,7 @@ def main(
         **trainer_params,
     )
 
+    _maybe_compile_backbone(model, model_params, uses_irregular_grid)
     logging.info(f"Logging to {logdir}")
     trainer.fit(model, train_dataloaders=data_loader)
     logging.info("Training completed.")
