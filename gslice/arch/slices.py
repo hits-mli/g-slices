@@ -1,3 +1,4 @@
+import math
 import warnings
 from collections.abc import Callable
 from typing import Optional
@@ -200,36 +201,50 @@ class SLiCE(nn.Module):
             aux = time_channel
         return torch.cat((aux, path), dim=-1) * self.scale
 
-    def _bound_operator_norm(self, M: torch.Tensor, iterations: int = 5, max_norm: float = 1.0) -> torch.Tensor:
+    def _bound_operator_norm(self, M: torch.Tensor, max_norm: float = 1.0) -> torch.Tensor:
         """
-        Bounds the operator norm (largest singular value) of the discretized matrices
-        using power iteration. This ensures the dynamics are non-expansive.
+        Rescale ``M`` so its spectral norm (largest singular value) is at most
+        ``max_norm``, making the linear update non-expansive.
+
+        Uses the Hoelder / interpolation inequality
+            sigma_max(M) <= sqrt(||M||_1 * ||M||_inf),
+        where ``||M||_1`` is the largest absolute column sum and ``||M||_inf`` the
+        largest absolute row sum. Unlike power iteration (which converges to
+        sigma_max from *below* and so may leave expansive matrices unscaled), this is
+        a certified *upper* bound: any matrix it leaves unscaled provably satisfies
+        sigma_max <= max_norm. It is deterministic (no random restart), costs two
+        reductions over each block instead of a sequence of matmuls, and is exact for
+        diagonal matrices (so it agrees with ``_discretize_diagonal``).
         """
-        h = M.shape[-1]
-        M_flat = M.view(-1, h, h)
-        batch_size = M_flat.shape[0]
+        abs_M = M.abs()
+        col = abs_M.sum(dim=-2).amax(dim=-1)  # ||M||_1  (max absolute column sum)
+        row = abs_M.sum(dim=-1).amax(dim=-1)  # ||M||_inf (max absolute row sum)
+        sigma_ub = (col * row).sqrt()  # >= sigma_max(M)
+        scale = torch.clamp(sigma_ub / max_norm, min=1.0)
+        return M / scale[..., None, None]
 
-        # Initialize random vector v: (batch_size, h, 1)
-        v = torch.randn(batch_size, h, 1, device=M.device, dtype=M.dtype)
-        v = torch.nn.functional.normalize(v, dim=1)
+    def _lognorm_shift(self, A: torch.Tensor, max_norm: float = 1.0) -> torch.Tensor:
+        """
+        For the ``matrix_exp`` path, bound the update *before* exponentiating so that
+        ``||exp(A)||_2 <= max_norm`` without ever forming the exponential's norm.
 
-        # Power iteration to estimate dominant right singular vector
-        for _ in range(iterations):
-            # v <- M^T M v
-            u = torch.bmm(M_flat, v)
-            v = torch.bmm(M_flat.transpose(1, 2), u)
-            v = torch.nn.functional.normalize(v, dim=1)
-
-        # Estimate singular value sigma = ||Mv||
-        u = torch.bmm(M_flat, v)
-        sigma = torch.norm(u, dim=1, keepdim=True)  # (batch_size, 1, 1)
-        
-        # Reshape sigma back to broadcast
-        sigma = sigma.view(*M.shape[:-2], 1, 1)
-
-        # Scale down if sigma > max_norm
-        scale = torch.clamp(sigma / max_norm, min=1.0)
-        return M / scale
+        Uses the logarithmic norm: ``||exp(A)||_2 <= exp(mu_2(A))`` with
+        ``mu_2(A) = lambda_max((A + A^T) / 2)``. Gershgorin's theorem bounds that
+        eigenvalue by
+            mu_hat = max_i [ A_ii + 1/2 * sum_{j != i} |A_ij + A_ji| ],
+        so subtracting ``relu(mu_hat - log(max_norm))`` from the diagonal drives
+        ``mu_2`` down to at most ``log(max_norm)`` and hence certifies the bound. This
+        is O(b^2) per block and deterministic.
+        """
+        d = A.shape[-1]
+        sym = 0.5 * (A + A.transpose(-1, -2))  # symmetric part
+        diag = torch.diagonal(sym, dim1=-2, dim2=-1)  # (..., d), Gershgorin centres
+        radius = sym.abs().sum(dim=-1) - diag.abs()  # (..., d), off-diagonal abs row sum
+        mu_hat = (diag + radius).amax(dim=-1)  # Gershgorin bound on lambda_max
+        shift = torch.clamp(mu_hat - math.log(max_norm), min=0.0)  # relu; log(1) = 0
+        eye = torch.eye(d, device=A.device, dtype=A.dtype)
+        eye = eye.view(*((1,) * (A.ndim - 2)), d, d)
+        return A - shift[..., None, None] * eye
 
     def _discretize_diagonal(self, A: torch.Tensor) -> torch.Tensor:
         if self.transition_mode == "matrix_exp":
@@ -247,15 +262,19 @@ class SLiCE(nn.Module):
 
     def _discretize_matrix(self, A: torch.Tensor) -> torch.Tensor:
         if self.transition_mode == "matrix_exp":
+            if self.bound_norm:
+                # Bound before exponentiating via the logarithmic norm, which
+                # certifies ||exp(A)||_2 <= 1 without forming the exponential.
+                A = self._lognorm_shift(A, max_norm=1.0)
             M = torch.matrix_exp(A)
         else:
             eye = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype)
             eye = eye.view(*((1,) * (A.ndim - 2)), A.shape[-2], A.shape[-1])
             M = eye + A
-            
-        if self.bound_norm:
-            M = self._bound_operator_norm(M, max_norm=1.0)
-            
+            if self.bound_norm:
+                # Certified Hoelder bound: sigma_max(M) <= 1.
+                M = self._bound_operator_norm(M, max_norm=1.0)
+
         return M
 
     def _build_elementwise_transform(
