@@ -77,7 +77,7 @@ CMD=(
     --device "${DEVICE}"
     --num_samples "${NUM_SAMPLES}"
     --seed "${SEED}"
-    --allowed_model_types "tsflow,slice"
+    --allowed_model_types "tsflow,slice,tsdiff_gp,tsdiff_ou,tsdiff_gauss"
     --fine_to_coarse_eval_adapter_override "repeat"
 )
 

@@ -1496,6 +1496,38 @@ def _extract_forecast_samples_2d(forecast: Any) -> np.ndarray:
     raise ValueError(f"Expected forecast samples with 1-3 dims, got shape {samples.shape}.")
 
 
+def _irregular_time_axis(
+    target_series: Any,
+    *,
+    total_length: int,
+    prediction_length: int,
+) -> Optional[np.ndarray]:
+    """True (gamma-sampled) observation times for an irregular ground-truth series.
+
+    `_irregular_entry_to_dataframe` stores the physical context/future time grids
+    (window-local hours, common origin) on the frame's `.attrs`. Returns their
+    concatenation as the x-axis, or None if the series is regular or the grids do
+    not line up with the target (caller then falls back to the period index).
+    """
+    if not isinstance(target_series, pd.DataFrame):
+        return None
+    grids = target_series.attrs.get("irregular_time_grids")
+    if not grids:
+        return None
+    context_time = np.asarray(grids.get("context_time", []), dtype=float).reshape(-1)
+    future_time = np.asarray(grids.get("future_time", []), dtype=float).reshape(-1)
+    if context_time.size == 0 or future_time.size == 0:
+        return None
+    full = np.concatenate([context_time, future_time])
+    if full.shape[0] != int(total_length) or future_time.shape[0] != int(prediction_length):
+        return None
+    if not np.all(np.diff(full) >= 0.0):
+        return None
+    # Rebase to window-local hours so the axis reads 0..(window span) rather than
+    # absolute hours-since-epoch; spacing and span are unchanged.
+    return full - full[0]
+
+
 def _build_paper_plot_panel_data(
     payload: FirstSeriesPlotPayload,
     *,
@@ -1522,20 +1554,38 @@ def _build_paper_plot_panel_data(
     history_start = max(0, history_values.shape[0] - context_length)
     visible_values = np.concatenate([history_values[history_start:], future_truth], axis=0)
 
-    if isinstance(target_index, (pd.DatetimeIndex, pd.Index)) and len(target_index) == len(target_values):
+    # For irregular grids, place observations at their true (gamma-sampled) times
+    # so the panel reflects the actual spacing and the full window span. The
+    # GluonTS `tss` index is a regular period range at the base frequency, which
+    # would otherwise render every k identically on a uniform axis.
+    irregular_axis = _irregular_time_axis(
+        payload.tss[series_index],
+        total_length=int(target_values.shape[0]),
+        prediction_length=prediction_length,
+    )
+    if irregular_axis is not None:
+        visible_index = irregular_axis[history_start:]
+        forecast_x = irregular_axis[-prediction_length:]
+        forecast_start = float(forecast_x[0])
+        uses_datetime = False
+        irregular_hours = True
+    elif isinstance(target_index, (pd.DatetimeIndex, pd.Index)) and len(target_index) == len(target_values):
         visible_index = target_index[history_start:]
         forecast_x = target_index[-prediction_length:]
         forecast_start = forecast_x[0]
+        _, uses_datetime = _coerce_plot_index(forecast_x)
+        irregular_hours = False
     else:
         visible_index = np.arange(history_start, target_values.shape[0], dtype=float)
         forecast_x = np.arange(target_values.shape[0] - prediction_length, target_values.shape[0], dtype=float)
         forecast_start = float(target_values.shape[0] - prediction_length)
+        _, uses_datetime = _coerce_plot_index(forecast_x)
+        irregular_hours = False
 
     forecast_mean = forecast_samples.mean(axis=0)
     forecast_lo = np.quantile(forecast_samples, 0.025, axis=0)
     forecast_hi = np.quantile(forecast_samples, 0.975, axis=0)
 
-    _, uses_datetime = _coerce_plot_index(forecast_x)
     return {
         "visible_index": visible_index,
         "visible_values": visible_values,
@@ -1545,6 +1595,7 @@ def _build_paper_plot_panel_data(
         "forecast_hi": forecast_hi,
         "forecast_start": forecast_start,
         "uses_datetime": uses_datetime,
+        "irregular_hours": irregular_hours,
         "panel_title": f"Evaluated on {_frequency_to_plain_english(payload.eval_freq)} data",
     }
 
@@ -1788,6 +1839,19 @@ def _frequency_panel_label(eval_freq: str, train_freq: str) -> str:
     if frequencies_match(str(eval_freq), str(train_freq)):
         return rf"$f_{{\mathrm{{train/test}}}}={eval_math}$"
     return rf"$f_{{\mathrm{{test}}}}={eval_math}$"
+
+
+def _gamma_k_from_dataset_name(name: str) -> Optional[float]:
+    """Extract the gamma-k of an irregular dataset name (e.g. ett_15min_k10_24h -> 10)."""
+    match = re.search(r"_k([0-9]+(?:p[0-9]+)?)(?:_|$)", str(name))
+    if match is None:
+        return None
+    return float(match.group(1).replace("p", "."))
+
+
+def _gamma_k_panel_label(gamma_k: float) -> str:
+    k_text = f"{gamma_k:g}"
+    return rf"$k={k_text}$"
 
 
 def _draw_publication_panel(
@@ -2052,10 +2116,22 @@ def _render_checkpoint_paper_plot(
         return None
 
     _set_plot_theme()
-    ordered_payloads = sorted(
-        plot_payloads,
-        key=lambda payload: (float(get_relative_time_step(str(payload.eval_freq))), str(payload.eval_dataset_name)),
-    )
+    # Cross-k (irregular) mode: when every eval grid shares the training frequency
+    # and carries a gamma-k, order and label panels by numeric k instead of by
+    # frequency (which would collapse to one identical label and lexicographic
+    # ordering: k1, k10, k100, k1000, k25, ...). Cross-frequency runs keep the
+    # frequency labelling untouched.
+    gamma_ks = {id(p): _gamma_k_from_dataset_name(p.eval_dataset_name) for p in plot_payloads}
+    freqs = {float(get_relative_time_step(str(p.eval_freq))) for p in plot_payloads}
+    cross_k_mode = len(freqs) == 1 and all(gamma_ks[id(p)] is not None for p in plot_payloads)
+
+    if cross_k_mode:
+        ordered_payloads = sorted(plot_payloads, key=lambda payload: gamma_ks[id(payload)])
+    else:
+        ordered_payloads = sorted(
+            plot_payloads,
+            key=lambda payload: (float(get_relative_time_step(str(payload.eval_freq))), str(payload.eval_dataset_name)),
+        )
     series_index = ordered_payloads[0].selected_indices[0] if ordered_payloads[0].selected_indices else 0
     train_freq = str(ordered_payloads[0].model_params.get("freq", ordered_payloads[0].eval_freq))
 
@@ -2063,7 +2139,11 @@ def _render_checkpoint_paper_plot(
     for payload in ordered_payloads:
         panel = _build_paper_plot_panel_data(payload, series_index=series_index)
         if panel is not None:
-            panels.append((_frequency_panel_label(str(payload.eval_freq), train_freq), panel))
+            if cross_k_mode:
+                label = _gamma_k_panel_label(gamma_ks[id(payload)])
+            else:
+                label = _frequency_panel_label(str(payload.eval_freq), train_freq)
+            panels.append((label, panel))
     if not panels:
         return None
 
@@ -2098,6 +2178,10 @@ def _render_checkpoint_paper_plot(
                 lambda value, _: rf"$\mathdefault{{{mdates.num2date(value).strftime('%H:%M')}}}$"
             )
         )
+    elif panels and all(panel.get("irregular_hours", False) for _, panel in panels):
+        # Irregular grids are drawn on their true window-local time axis (hours).
+        axes[-1].xaxis.set_major_locator(mticker.MaxNLocator(nbins=5))
+        axes[-1].set_xlabel(r"$\mathrm{Time\ (hours)}$", fontsize=16, labelpad=3)
 
     fig.legend(
         handles=_make_publication_legend_handles(),
@@ -2110,7 +2194,8 @@ def _render_checkpoint_paper_plot(
         handletextpad=0.7,
         columnspacing=1.7,
     )
-    fig.subplots_adjust(left=0.12, right=0.99, bottom=0.11, top=0.86, hspace=0.16)
+    bottom_margin = 0.13 if (panels and all(panel.get("irregular_hours", False) for _, panel in panels)) else 0.11
+    fig.subplots_adjust(left=0.12, right=0.99, bottom=bottom_margin, top=0.86, hspace=0.16)
     return fig
 
 

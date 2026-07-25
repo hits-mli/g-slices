@@ -93,6 +93,23 @@ python bin/train.py \
 
 To run the other irregular settings, repeat the same command family for the remaining `k` values and keep the `runtime.logdir` in sync with the dataset you launched. The evaluation scripts rely on this structure when they discover checkpoints.
 
+##### DSPD (tsdiff) baselines
+
+The stochastic-process-diffusion baselines (Biloš et al., ICML 2023) reuse the same data pipeline, windows and splits, but are otherwise the published method: `diffusion_params` in the model config selects `TSDiffCond`, whose diffusion math **and denoiser network** run upstream code vendored byte-identical under `gslice/vendor/tsdiff/`. By default (`diffusion_params.denoiser: tsdiff_rnn`) the denoiser is the upstream `RNNModel` — a 2-layer bidirectional GRU, hidden 128 — with upstream's CSDI-style channel conditioning (noisy window, clean scaled context, observation mask); it receives neither the GP-posterior features nor lag features, because the published method has neither. Setting `denoiser: gslices` instead swaps in this repo's SLiCE/S4 backbone, which is the controlled "same architecture, different generative core" ablation rather than the published-method baseline. Train them exactly like the slice runs, one family directory per noise kernel:
+
+```bash
+for variant in gp ou gauss; do
+python bin/train.py \
+    experiment=irregular \
+    dataset=irregular/ett_15min_k1_24h \
+    model=tsdiff_${variant}_irregular \
+    seed=6432 \
+    runtime.logdir=results/irregular_generalisation/tsdiff_${variant}/k1
+done
+```
+
+`tsdiff_gp` is DSPD-GP (the paper's headline forecasting variant), `tsdiff_ou` is DSPD-OU (prior-matched to the OU-kernel GP prior these experiments use), and `tsdiff_gauss` is the i.i.d.-noise DDPM ablation. Keep the three families in separate `results/.../tsdiff_<variant>/` directories — evaluation discovery treats each as its own model type. The evaluation commands below pick them up automatically alongside `tsflow` and `slice`. For the cross-frequency branch, use `model=tsdiff_${variant}_subsample` with `runtime.logdir=results/subsample_generalisation/tsdiff_${variant}/<grid>` in the commands of section 3.1.
+
 After the runs complete, cross-evaluate the checkpoints on each grid with:
 
 ```bash

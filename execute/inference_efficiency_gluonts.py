@@ -18,6 +18,7 @@ from gluonts.time_feature import time_features_from_frequency_str
 from gluonts.torch.batchify import batchify
 
 from gslice.dataset import get_dataset_name_from_params, get_gts_dataset_from_params, infer_target_dim
+from gslice.model.tsdiff_cond import TSDiffCond
 from gslice.model.tsflow_cond import TSFlowCond
 from gslice.utils import create_transforms
 from gslice.utils.util import create_splitter
@@ -111,6 +112,7 @@ def _read_yaml(path: str) -> Dict[str, Any]:
             "gp_fit_context_only",
             "lags_seq",
             "prior_context_length_override",
+            "diffusion_params",
         ]:
             if key in hparams:
                 model_params[key] = hparams[key]
@@ -274,7 +276,17 @@ def _clean_prior_params(prior_params: Optional[dict]) -> Optional[dict]:
 def _create_tsflow_model(config: Dict[str, Any], target_dim: int) -> TSFlowCond:
     setting = config["setting"]
     model_params = config["model_params"]
-    return TSFlowCond(
+    # TSDiffCond checkpoints have state-dict keys identical to TSFlowCond's, so a
+    # missed dispatch here would strict-load fine and silently sample with the
+    # flow ODE. Presence of diffusion_params is the only marker.
+    diffusion_params = model_params.get("diffusion_params")
+    if diffusion_params is not None:
+        model_cls = TSDiffCond
+        extra_kwargs = {"diffusion_params": diffusion_params}
+    else:
+        model_cls = TSFlowCond
+        extra_kwargs = {}
+    return model_cls(
         setting=setting,
         target_dim=target_dim,
         context_length=model_params["context_length"],
@@ -295,6 +307,7 @@ def _create_tsflow_model(config: Dict[str, Any], target_dim: int) -> TSFlowCond:
         lags_seq=model_params.get("lags_seq"),
         prior_context_length_override=model_params.get("prior_context_length_override"),
         gp_fit_context_only=model_params.get("gp_fit_context_only", False),
+        **extra_kwargs,
     )
 
 

@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -63,14 +64,27 @@ def _resolve_run_config_path(run_dir: Path) -> Path | None:
     return None
 
 
+_KNOWN_MODEL_DIRS = {
+    "tsflow": "tsflow",
+    "slice": "slice",
+    "tsflow_run": "tsflow",
+    # DSPD (tsdiff) baselines: one family dir per noise kernel — discovery
+    # dedupes on (model_type, dataset, seed), so merging them under a single
+    # dir would silently collapse the kernels.
+    "tsdiff_gp": "tsdiff_gp",
+    "tsdiff_ou": "tsdiff_ou",
+    "tsdiff_gauss": "tsdiff_gauss",
+}
+
+
 def _candidate_model_roots(results_root: Path) -> list[tuple[Path, str]]:
     candidates: list[tuple[Path, str]] = []
-    for dirname, model_type in {"tsflow": "tsflow", "slice": "slice", "tsflow_run": "tsflow"}.items():
+    for dirname, model_type in _KNOWN_MODEL_DIRS.items():
         candidate = results_root / dirname
         if candidate.is_dir():
             candidates.append((candidate, model_type))
-    if results_root.name in {"tsflow", "slice", "tsflow_run"} and results_root.is_dir():
-        candidates.append((results_root, "tsflow" if results_root.name == "tsflow_run" else results_root.name))
+    if results_root.name in _KNOWN_MODEL_DIRS and results_root.is_dir():
+        candidates.append((results_root, _KNOWN_MODEL_DIRS[results_root.name]))
     return candidates
 
 
@@ -170,8 +184,13 @@ def _materialize_regular_eval_config(*, output_dir: Path, run: RunSpec) -> Path:
     }
     target_path = output_dir / "_eval_dataset_configs" / f"{_slugify(run.dataset_family)}__regular.yaml"
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    with target_path.open("w") as fp:
+    # The filename depends only on the dataset family, so every seed-group (and,
+    # under --num_shards, every concurrent shard) writes the same path. Write via
+    # a unique temp file + atomic rename so a reader never sees a partial file.
+    tmp_path = target_path.with_name(f"{target_path.name}.tmp{os.getpid()}")
+    with tmp_path.open("w") as fp:
         yaml.safe_dump(regular_config, fp, sort_keys=False)
+    tmp_path.replace(target_path)
     return target_path
 
 
@@ -212,7 +231,9 @@ def _run_eval(
         "--config_paths",
         repr([str(run.config_path)]),
         "--model_types",
-        repr([run.model_type if run.model_type != "slice" else "tsflow"]),
+        # slice and the tsdiff families ride TSFlowCond's eval surface; the class
+        # is re-selected from diffusion_params inside _create_tsflow_model.
+        repr(["tsflow" if run.model_type in {"slice", "tsdiff_gp", "tsdiff_ou", "tsdiff_gauss"} else run.model_type]),
         "--labels",
         repr([run.label]),
         "--eval_dataset_configs",
@@ -372,50 +393,95 @@ def main() -> None:
     parser.add_argument("--adapter_mode", default="none")
     parser.add_argument("--checkpoint_variant", choices=("best", "last"), default="best")
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--num_shards",
+        type=int,
+        default=1,
+        help="Split the per-checkpoint evaluations across this many independent processes/GPUs.",
+    )
+    parser.add_argument(
+        "--shard_index",
+        type=int,
+        default=0,
+        help="Which shard this process handles (0 <= shard_index < num_shards).",
+    )
+    parser.add_argument(
+        "--aggregate_only",
+        action="store_true",
+        help="Skip evaluation and only aggregate/emit tables from raw JSONs already on disk.",
+    )
     args = parser.parse_args()
+
+    num_shards = max(1, int(args.num_shards))
+    shard_index = int(args.shard_index)
+    if not 0 <= shard_index < num_shards:
+        raise SystemExit(f"--shard_index must satisfy 0 <= index < {num_shards}, got {shard_index}.")
 
     results_root = Path(args.results_root).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.aggregate_only:
+        # Sharded mode: every shard writes only its own raw JSONs, so aggregation
+        # runs once afterwards over the complete set.
+        _aggregate_seed_results(output_dir)
+        _write_values_markdown(output_dir)
+        return
+
     runs = _discover_runs(results_root, checkpoint_variant=str(args.checkpoint_variant))
     grouped = _group_runs(runs)
     repo_root = Path(__file__).resolve().parents[1]
 
-    failures = 0
+    # Flatten to one work item per checkpoint. The eval-dataset list stays derived
+    # from the *full* group, so every checkpoint is still evaluated against every
+    # grid regardless of how the work is sharded.
+    work: list[tuple[Any, list[Path], Path]] = []
     for (_, _, _), group_runs in sorted(grouped.items()):
         ordered_group_runs = sorted(group_runs, key=lambda item: item.gamma_k)
         cross_irregular_configs = [run.config_path for run in ordered_group_runs]
         regular_eval_config = _materialize_regular_eval_config(output_dir=output_dir, run=ordered_group_runs[0])
-        for run in sorted(group_runs, key=lambda item: item.gamma_k):
-            failures += _run_eval(
-                repo_root=repo_root,
-                run=run,
-                eval_mode="cross_irregular",
-                eval_dataset_configs=cross_irregular_configs,
-                output_dir=output_dir,
-                save_json=_raw_eval_json_path(output_dir=output_dir, eval_mode="cross_irregular", run=run),
-                device=args.device,
-                num_samples=int(args.num_samples),
-                seed=args.seed,
-                adapter_mode=None if args.adapter_mode == "none" else args.adapter_mode,
-                dry_run=bool(args.dry_run),
-            )
-            failures += _run_eval(
-                repo_root=repo_root,
-                run=run,
-                eval_mode="regular_grid",
-                eval_dataset_configs=[regular_eval_config],
-                output_dir=output_dir,
-                save_json=_raw_eval_json_path(output_dir=output_dir, eval_mode="regular_grid", run=run),
-                device=args.device,
-                num_samples=int(args.num_samples),
-                seed=args.seed,
-                adapter_mode=None if args.adapter_mode == "none" else args.adapter_mode,
-                dry_run=bool(args.dry_run),
-            )
+        for run in ordered_group_runs:
+            work.append((run, cross_irregular_configs, regular_eval_config))
 
-    if not args.dry_run:
+    shard_work = work[shard_index::num_shards]
+    if num_shards > 1:
+        print(
+            f"[shard {shard_index}/{num_shards}] handling {len(shard_work)} of {len(work)} checkpoints",
+            flush=True,
+        )
+
+    failures = 0
+    for run, cross_irregular_configs, regular_eval_config in shard_work:
+        failures += _run_eval(
+            repo_root=repo_root,
+            run=run,
+            eval_mode="cross_irregular",
+            eval_dataset_configs=cross_irregular_configs,
+            output_dir=output_dir,
+            save_json=_raw_eval_json_path(output_dir=output_dir, eval_mode="cross_irregular", run=run),
+            device=args.device,
+            num_samples=int(args.num_samples),
+            seed=args.seed,
+            adapter_mode=None if args.adapter_mode == "none" else args.adapter_mode,
+            dry_run=bool(args.dry_run),
+        )
+        failures += _run_eval(
+            repo_root=repo_root,
+            run=run,
+            eval_mode="regular_grid",
+            eval_dataset_configs=[regular_eval_config],
+            output_dir=output_dir,
+            save_json=_raw_eval_json_path(output_dir=output_dir, eval_mode="regular_grid", run=run),
+            device=args.device,
+            num_samples=int(args.num_samples),
+            seed=args.seed,
+            adapter_mode=None if args.adapter_mode == "none" else args.adapter_mode,
+            dry_run=bool(args.dry_run),
+        )
+
+    # With --num_shards > 1 each shard only owns part of the raw JSONs, so the
+    # caller aggregates once after all shards finish (--aggregate_only).
+    if not args.dry_run and num_shards == 1:
         _aggregate_seed_results(output_dir)
         _write_values_markdown(output_dir)
     if failures:

@@ -86,6 +86,12 @@ def _candidate_model_roots(results_root: Path) -> list[tuple[Path, str]]:
         "slice": "slice",
         "tsflow_run": "tsflow",
         "lcde": "lcde",
+        # DSPD (tsdiff) baselines: one family dir per noise kernel — discovery
+        # dedupes on (model_type, dataset, seed), so merging them under a single
+        # dir would silently collapse the kernels.
+        "tsdiff_gp": "tsdiff_gp",
+        "tsdiff_ou": "tsdiff_ou",
+        "tsdiff_gauss": "tsdiff_gauss",
     }
     for dirname, model_type in known_dirs.items():
         candidate = results_root / dirname
@@ -190,6 +196,9 @@ def _display_model_name(model_type: str) -> str:
         "tsflow": "TSFlow",
         "slice": "SLiCE",
         "lcde": "LCDE",
+        "tsdiff_gp": "DSPD-GP",
+        "tsdiff_ou": "DSPD-OU",
+        "tsdiff_gauss": "DSPD-Gauss",
     }.get(model_type, str(model_type))
 
 
@@ -296,7 +305,12 @@ def _build_eval_command(
         str(_preferred_dataset_name([run.config_path.relative_to(repo_root).as_posix() for run in dataset_aliases[canonical]]))
         for canonical in sorted(dataset_aliases, key=lambda name: (dataset_sort_step[name], name))
     ]
-    eval_model_type = "tsflow" if model_type == "slice" else model_type
+    # slice and the tsdiff families share TSFlowCond's whole eval surface; the
+    # checkpoint evaluator only understands {tsflow, lcde}, and the actual class
+    # is re-selected from diffusion_params inside _create_tsflow_model.
+    eval_model_type = (
+        "tsflow" if model_type in {"slice", "tsdiff_gp", "tsdiff_ou", "tsdiff_gauss"} else model_type
+    )
     model_output_dir = output_dir / model_type
     output_json = model_output_dir / f"{family_key}.json"
     output_csv = model_output_dir / f"{family_key}.csv"
@@ -449,7 +463,7 @@ def main() -> None:
     parser.add_argument(
         "--allowed_model_types",
         type=str,
-        default="tsflow,slice,lcde",
+        default="tsflow,slice,lcde,tsdiff_gp,tsdiff_ou,tsdiff_gauss",
         help="Comma-separated subset of model roots to include, e.g. tsflow,slice",
     )
     parser.add_argument(
