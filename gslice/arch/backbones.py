@@ -151,6 +151,62 @@ class SliceLayer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout1d(dropout) if dropout > 0.0 else nn.Identity()
 
+    def _can_batch_directions(self, z_seq):
+        # The batched fast path replays SLiCELayer.forward inline, so it is only
+        # valid for the exact configuration it mirrors: prenorm, no second norm,
+        # no active dropout on the residual branches, and a diagonal_dense
+        # parallel scan whose sequence fits in a single chunk.
+        if not self.bidirectional:
+            return False
+        for lay in (self.layer, self.layer_bwd):
+            sl = lay.slice
+            if not (
+                lay.prenorm
+                and lay.norm2 is None
+                and lay.dropout_position == "residual"
+                and lay.drop.p == 0.0
+                and sl.use_parallel
+                and sl.diagonal_dense
+                and z_seq.shape[1] <= sl.chunk_size
+            ):
+                return False
+        return True
+
+    def _forward_batched_directions(self, z_seq, time_grid):
+        # Both directions' affine scan transforms are concatenated along the
+        # batch dimension and swept by ONE associative scan: the scan itself is
+        # weight-free, so per-element arithmetic is identical to two sequential
+        # per-direction scans. The weighted projections and FFN keep their own
+        # per-direction parameters and run unchanged.
+        dirs = (
+            (self.layer, z_seq, time_grid),
+            (self.layer_bwd, z_seq.flip(1), time_grid.flip(1)),
+        )
+        transforms, y0s, x_dirs = [], [], []
+        for slayer, x_dir, t_dir in dirs:
+            sl = slayer.slice
+            x_norm = slayer.norm1(x_dir)
+            inp = sl._prepare_augmented_inputs(x_norm, t_dir)
+            transforms.append(sl._build_diagonal_dense_transform(inp))
+            if sl.input_dependent_init:
+                y0s.append(sl.init(x_norm[:, 0, :]))
+            else:
+                y0s.append(sl.init.unsqueeze(0).expand(x_dir.shape[0], -1))
+            x_dirs.append(x_dir)
+        merged = tuple(torch.cat(parts, dim=0) for parts in zip(*transforms))
+        y0 = torch.cat(y0s, dim=0)
+        sl0 = self.layer.slice
+        combine_fn, _build_fn, apply_fn = sl0._scan_kernels_diagonal_dense()
+        prefix = sl0._generic_associative_scan(combine_fn, merged, 1)
+        y = apply_fn(prefix, y0)
+        batch = z_seq.shape[0]
+        outs = []
+        for i, (slayer, _, _) in enumerate(dirs):
+            out_dir = x_dirs[i] + y[i * batch : (i + 1) * batch]
+            out_dir = out_dir + slayer.token_mlp(out_dir)
+            outs.append(out_dir)
+        return self.output_proj(torch.cat([outs[0], outs[1].flip(1)], dim=-1))
+
     def forward(self, x, time_grid):
         """
         Input x is shape (B, d_input, L), time_grid is shape (B, L, 1)
@@ -158,10 +214,13 @@ class SliceLayer(nn.Module):
         z = x
         z = self.norm(z.transpose(-1, -2)).transpose(-1, -2)
         z_seq = z.transpose(-1, -2)
-        out = self.layer(z_seq, time_grid)
-        if self.bidirectional:
-            out_bwd = self.layer_bwd(z_seq.flip(1), time_grid.flip(1)).flip(1)
-            out = self.output_proj(torch.cat([out, out_bwd], dim=-1))
+        if self._can_batch_directions(z_seq):
+            out = self._forward_batched_directions(z_seq, time_grid)
+        else:
+            out = self.layer(z_seq, time_grid)
+            if self.bidirectional:
+                out_bwd = self.layer_bwd(z_seq.flip(1), time_grid.flip(1)).flip(1)
+                out = self.output_proj(torch.cat([out, out_bwd], dim=-1))
         out = self.dropout(out.transpose(-1, -2))
         x = out + x
         return x, None

@@ -314,17 +314,30 @@ class SLiCE(nn.Module):
         bsz = self.block_size
         hdiag = self.hidden_dim - bsz
 
-        A_diag = self.vf_A_diag(inp)
-        M_diag = self._discretize_diagonal(A_diag)
-
-        A_dense = self.vf_A_dense(inp).view(*inp.shape[:-1], bsz, bsz)
-        M_dense = self._discretize_matrix(A_dense)
-
         if self.bias:
-            B = self.vf_B(inp)
+            # vf_A_diag, vf_A_dense and vf_B all project the same input, so a
+            # row-concatenation of their weights turns three GEMMs into one.
+            # Each output element remains the identical dot product; the cat is
+            # differentiable, so gradients land on the original parameters.
+            W = torch.cat(
+                (self.vf_A_diag.weight, self.vf_A_dense.weight, self.vf_B.weight),
+                dim=0,
+            )
+            out = torch.nn.functional.linear(inp, W)
+            A_diag = out[..., :hdiag]
+            A_dense = out[..., hdiag : hdiag + bsz * bsz].view(
+                *inp.shape[:-1], bsz, bsz
+            )
+            B = out[..., hdiag + bsz * bsz :]
             b_diag = B[..., :hdiag]
             b_dense = B[..., hdiag:]
+            M_diag = self._discretize_diagonal(A_diag)
+            M_dense = self._discretize_matrix(A_dense)
         else:
+            A_diag = self.vf_A_diag(inp)
+            M_diag = self._discretize_diagonal(A_diag)
+            A_dense = self.vf_A_dense(inp).view(*inp.shape[:-1], bsz, bsz)
+            M_dense = self._discretize_matrix(A_dense)
             b_diag = torch.zeros_like(M_diag)
             b_dense = torch.zeros(
                 *inp.shape[:-1],

@@ -129,7 +129,8 @@ def _build(cfg: dict, device: torch.device) -> BackboneModel:
     return BackboneModel(**cfg).to(device)
 
 
-def bench_throughput(name: str, cfg: dict, device: torch.device, B: int, L: int, reps: int) -> dict:
+def bench_throughput(name: str, cfg: dict, device: torch.device, B: int, L: int,
+                     reps: int, modes: tuple = ("reduce-overhead", "max-autotune")) -> dict:
     x = torch.randn(B, L, 1, device=device)
     tg = torch.linspace(0, 1, L, device=device).view(1, L, 1).expand(B, L, 1).contiguous()
     t = torch.tensor(0.5, device=device)
@@ -153,8 +154,8 @@ def bench_throughput(name: str, cfg: dict, device: torch.device, B: int, L: int,
 
     print(f"== {name} throughput (B={B}, L={L}) ==")
     results: dict = {"eager": measure(lambda: _build(cfg, device))}
-    for mode in ("default", "reduce-overhead"):
-        if device.type != "cuda" and mode == "reduce-overhead":
+    for mode in modes:
+        if device.type != "cuda" and mode in ("reduce-overhead", "max-autotune"):
             print(f"  {'compile ' + mode:26s} skipped (needs CUDA)")
             continue
         try:
@@ -191,6 +192,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--length", type=int, default=60)
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument("--modes", default="reduce-overhead,max-autotune",
+                    help="comma-separated torch.compile modes to sweep "
+                         "(max-autotune is the training default; drop it for quick runs)")
     args = ap.parse_args()
     device = torch.device(args.device)
     print(f"device={device}; torch={torch.__version__}\n")
@@ -201,14 +205,17 @@ def main() -> None:
 
     if args.sections in ("throughput", "all"):
         res = {}
+        modes = tuple(m.strip() for m in args.modes.split(",") if m.strip())
         if args.model in ("slice", "both"):
             res["slice"] = bench_throughput(
-                "SLiCE (wiki-like)", SLICE_CFG, device, args.batch, args.length, args.reps
+                "SLiCE (wiki-like)", SLICE_CFG, device, args.batch, args.length,
+                args.reps, modes=modes,
             )
             print()
         if args.model in ("s4", "both"):
             res["s4"] = bench_throughput(
-                "S4 (tsflow_s4)", S4_CFG, device, args.batch, args.length, args.reps
+                "S4 (tsflow_s4)", S4_CFG, device, args.batch, args.length,
+                args.reps, modes=modes,
             )
             print()
         if "slice" in res and "s4" in res:
