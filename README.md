@@ -98,11 +98,15 @@ The recommended Conda environment is defined in `environment.yml`. Create and ac
 ```bash
 conda env create -f environment.yml
 conda activate cde-forecast-matching
-python -m pip install -e .
-python -m pip install --no-deps "torch-slices>=0.3,<0.4"
 ```
 
-The environment is based on **PyTorch 2.6** and **CUDA 12.4**. The package `torch-slices` currently requires `torch>=2.8`. It is therefore installed with `--no-deps` to avoid pip upgrading Torch to CUDA 13 wheels, which require newer NVIDIA drivers. If your cluster requires a different PyTorch/CUDA runtime, adjust the PyTorch lines in `environment.yml` before creating the environment.
+The environment is based on **PyTorch 2.9** and **CUDA 12.6** wheels (installed via
+pip with a pinned `cu126` index so dependencies cannot pull CUDA-13 wheels, which
+require newer NVIDIA drivers than the cluster's GPU nodes). `gslice` and `bin` are
+plain top-level packages: there is no `setup.py`, so run everything from the
+repository root (the `submit/*.sh` scripts export `PYTHONPATH` accordingly). If
+your cluster requires a different PyTorch/CUDA runtime, adjust the torch lines in
+`environment.yml` before creating the environment.
 
 
 ## Citation

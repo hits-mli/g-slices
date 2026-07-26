@@ -1,7 +1,5 @@
 name: cde-forecast-matching
 channels:
-  - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
@@ -22,10 +20,8 @@ dependencies:
   - hydra-core>=1.3,<1.4
   - aim>=3.20,<4
 
-  # PyTorch GPU stack. Keep Torch below 2.7 so pip dependencies cannot upgrade it
-  # to CUDA 13 wheels, which require newer drivers than the Genoa GPU nodes.
-  - pytorch>=2.5,<2.7
-  - pytorch-cuda=12.4
+  # Lightning comes from conda-forge; Torch itself is installed via pip below
+  # (the conda pytorch channel stopped publishing builds after 2.5).
   - lightning>=2.5,<3
   - pytorch-lightning>=2.5,<3
 
@@ -42,7 +38,11 @@ dependencies:
   # - ipykernel>=7,<8
 
   - pip:
-      - torch>=2.5,<2.7
+      # CUDA 12.6 wheels: the pinned index keeps pip off CUDA-13 wheels, which
+      # need newer drivers than the Genoa GPU nodes. Torch 2.9 + cu126 is
+      # validated end-to-end on the cluster (training, GP prior, evaluation).
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch>=2.9,<3.0
       - linear-attention-transformer>=0.19,<0.20
       - pykeops>=2.3,<3
       - torchcde>=0.2,<0.3
